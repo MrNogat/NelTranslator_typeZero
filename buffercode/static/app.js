@@ -34,8 +34,6 @@ function setupWebSocketHandlers() {
         pttBtn.disabled = false;
         initializeMicrophone();
     };
-    
-    // --- BLOCO onmessage MODIFICADO ---
     ws.onmessage = async (event) => {
         if (event.data instanceof ArrayBuffer) {
             playbackQueue.push(event.data);
@@ -43,38 +41,20 @@ function setupWebSocketHandlers() {
             return;
         }
         const data = JSON.parse(event.data);
-        
-        // Vamos buscar os elementos de UI aqui
-        const liveTranscriptDiv = document.getElementById('live-transcript');
-        const liveTranslationDiv = document.getElementById('live-translation');
-
         switch (data.type) {
             case 'user_joined':
                 addMessage(`System: User '${data.user_id}' has joined.`, 'system-message');
                 break;
             case 'partial_transcript':
-                // A sua própria fala
-                liveTranscriptDiv.textContent = `Speaking: ${data.text}`;
+                document.getElementById('live-transcript').textContent = `Speaking: ${data.text}`;
                 break;
             case 'my_final_transcription':
-                // A sua própria fala finalizada
-                liveTranscriptDiv.textContent = ''; // Limpa o "Speaking..."
+                document.getElementById('live-transcript').textContent = '';
                 addMessage(`You: ${data.text}`, 'my-message');
                 break;
-            
-            // --- NOVOS CASOS ---
-            case 'partial_translation':
-                // Legenda de tradução ao vivo de outra pessoa
-                liveTranslationDiv.textContent = `[Translating ${data.speaker}]: ${data.text}`;
-                break;
-            
             case 'translated_message':
-                // A tradução final chegou
-                liveTranslationDiv.textContent = ''; // Limpa a legenda ao vivo
                 addMessage(`[${data.speaker}]: ${data.text}`, 'other-message');
                 break;
-            // --- FIM DOS NOVOS CASOS ---
-
             case 'user_left':
                 addMessage(`System: User '${data.user_id}' has left.`, 'system-message');
                 break;
@@ -83,8 +63,6 @@ function setupWebSocketHandlers() {
                 break;
         }
     };
-    // --- FIM DO BLOCO onmessage MODIFICADO ---
-
     ws.onclose = () => {
         statusDiv.textContent = "Status: Disconnected";
         connectBtn.textContent = "Join Session";

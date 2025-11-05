@@ -84,16 +84,29 @@ async def speechmatics_processor(audio_stream: asyncio.Queue, processing_queue: 
                 await sm_ws.send_str(json.dumps(config))
                 
                 current_sentence = ""; last_partial_text = ""
+                # Criamos um "lock" para garantir que não tentamos modificar
+                # current_sentence a partir de duas tarefas ao mesmo tempo
+                text_lock = asyncio.Lock()
 
                 async def finalize_and_queue():
+                    """
+                    Pega no texto atual, envia-o para processamento e limpa o buffer.
+                    """
                     nonlocal current_sentence, last_partial_text
-                    final_text = current_sentence.strip() or last_partial_text.strip()
-                    if final_text:
-                        print(f"\n[QUEUED from user]: {final_text}")
-                        await processing_queue.put(final_text)
-                    current_sentence = ""; last_partial_text = ""
+                    final_text = ""
+                    async with text_lock:
+                        # Prioriza a frase completa. Se vazia, usa o último parcial.
+                        final_text = current_sentence.strip() or last_partial_text.strip()
+                        if final_text:
+                            print(f"\n[QUEUED from user (chunk)]: {final_text}")
+                            await processing_queue.put(final_text)
+                        
+                        # CRÍTICO: Limpa a frase para o próximo chunk
+                        current_sentence = ""
+                        last_partial_text = "" # Limpa também para evitar dados velhos
 
                 async def audio_sender():
+                    """Envia áudio do cliente para a Speechmatics. (Sem alterações)"""
                     while True:
                         audio_chunk = await audio_stream.get()
                         if audio_chunk is None: break
@@ -102,48 +115,179 @@ async def speechmatics_processor(audio_stream: asyncio.Queue, processing_queue: 
                     if not sm_ws.closed: await sm_ws.send_str(json.dumps({"message": "EndOfStream"}))
 
                 async def transcript_receiver():
+                    """Recebe transcrições da Speechmatics. (Modificado para usar lock)"""
                     nonlocal current_sentence, last_partial_text
                     async for msg in sm_ws:
                         if msg.type != aiohttp.WSMsgType.TEXT: continue
                         data = json.loads(msg.data); msg_type = data.get("message")
-                        if msg_type == "AddPartialTranscript":
-                            results = data.get("results", [])
-                            if results and results[0].get("alternatives"):
-                                partial = results[0]["alternatives"][0].get("content", "")
-                                display_text = f"{current_sentence} {partial}".strip()
-                                last_partial_text = display_text
-                                await speaker_ws.send_json({"type": "partial_transcript", "text": display_text})
-                        elif msg_type == "AddTranscript":
-                            results = data.get("results", [])
-                            for res in results:
-                                if res.get("alternatives"): current_sentence += res["alternatives"][0].get("content", "") + " "
+                        
+                        async with text_lock: # Protege o acesso ao texto
+                            if msg_type == "AddPartialTranscript":
+                                results = data.get("results", [])
+                                if results and results[0].get("alternatives"):
+                                    partial = results[0]["alternatives"][0].get("content", "")
+                                    # O display é a frase deste chunk + o parcial novo
+                                    display_text = f"{current_sentence} {partial}".strip()
+                                    last_partial_text = display_text # Guarda para o caso de finalização
+                                    await speaker_ws.send_json({"type": "partial_transcript", "text": display_text})
+                            
+                            elif msg_type == "AddTranscript":
+                                results = data.get("results", [])
+                                for res in results:
+                                    if res.get("alternatives"): 
+                                        current_sentence += res["alternatives"][0].get("content", "") + " "
                 
                 async def event_watcher():
+                    """Espera pelo 'mouseup' (end_speech_event) para finalizar o último pedaço."""
+                    await end_speech_event.wait()
+                    print("\n[EVENT]: MouseUp detectado, finalizando último chunk...")
+                    await finalize_and_queue() # Envia o que sobrou
+                    # Limpa o texto "Speaking: ..." do ecrã do utilizador
+                    try:
+                        await speaker_ws.send_json({"type": "partial_transcript", "text": ""})
+                    except Exception:
+                        pass # O user pode ter desconectado
+                    end_speech_event.clear() # CRÍTICO: Reseta o evento para a próxima fala
+
+                # --- AQUI ESTÁ A NOVA LÓGICA DE CHUNKING ---
+                async def periodic_finalizer(interval_seconds: int):
+                    """
+                    Nova tarefa: finaliza o texto a cada N segundos, 
+                    simulando os "chunks" que você pediu.
+                    """
                     while True:
-                        await end_speech_event.wait()
-                        end_speech_event.clear()
+                        await asyncio.sleep(interval_seconds)
+                        # Se o utilizador soltou o botão, a event_watcher tratará disso.
+                        if end_speech_event.is_set():
+                            await asyncio.sleep(0.1) # Dá tempo à event_watcher para limpar
+                            continue # Volta ao início do loop e espera
+                        
+                        # Se o utilizador ainda está a falar, finaliza o chunk atual
+                        print(f"\n[TIMER]: {interval_seconds}s atingido, finalizando chunk...")
                         await finalize_and_queue()
 
-                await asyncio.gather(audio_sender(), transcript_receiver(), event_watcher())
+
+                # Inicia todas as tarefas, incluindo o novo finalizador periódico
+                await asyncio.gather(
+                    audio_sender(), 
+                    transcript_receiver(), 
+                    event_watcher(),
+                    periodic_finalizer(interval_seconds=5) # <-- A LÓGICA DE 3 SEGUNDOS
+                )
+                
+                # Limpeza final caso algo tenha sobrado (ex: desconexão abrupta)
                 await finalize_and_queue()
+
     except Exception:
         print(f"--- !!! CRITICAL ERROR IN STT TASK !!! ---"); traceback.print_exc()
         try: await speaker_ws.send_json({"type": "system_error", "message": "Connection to speech-to-text service failed."})
         except Exception: pass
 
+async def stream_translation_and_tts(text_to_translate: str, source_lang: str, target_conn: UserConnection, speaker_id: str):
+    """
+    1. Faz streaming da tradução de TEXTO para o cliente de destino (para legendas ao vivo).
+    2. Acumula o texto completo.
+    3. Envia o texto completo para o gerador de ÁUDIO TTS (camb_ai_tts_generator).
+    """
+    headers = {"x-api-key": CAMB_API_KEY, "Content-Type": "application/json"}
+    
+    # --- A CORREÇÃO ESTÁ AQUI ---
+    # Convertemos os códigos de idioma (ex: "pt") para os IDs numéricos (ex: 111)
+    source_language_id = LANGUAGE_ID_MAP.get(source_lang)
+    target_language_id = LANGUAGE_ID_MAP.get(target_conn.lang)
+
+    # Se algum dos idiomas não for encontrado no mapa, aborta para evitar erros.
+    if not source_language_id or not target_language_id:
+        print(f"Erro: Códigos de idioma inválidos. Fonte: {source_lang}, Destino: {target_conn.lang}")
+        return
+    
+    payload = {
+        "text": text_to_translate,
+        "source_language": source_language_id, # <- Corrigido
+        "target_language": target_language_id  # <- Corrigido
+    }
+    # --- FIM DA CORREÇÃO ---
+    
+    full_translated_text = ""
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Usamos o novo endpoint de streaming
+            async with session.post(f"{CAMB_TTS_BASE_URL}/translation/stream", json=payload, headers=headers) as r:
+                r.raise_for_status() # Isto irá agora falhar se o payload estiver errado
+                
+                # Fazemos o streaming da resposta
+                async for chunk in r.content.iter_any():
+                    if chunk:
+                        decoded_chunk = chunk.decode('utf-8')
+                        full_translated_text += decoded_chunk
+                        
+                        # Envia a tradução parcial para legendas ao vivo
+                        await target_conn.ws.send_json({
+                            "type": "partial_translation",
+                            "speaker": speaker_id,
+                            "text": full_translated_text
+                        })
+
+        # O Streaming terminou. Agora temos o texto completo.
+        # Envia a mensagem final (para o histórico de chat)
+        await target_conn.ws.send_json({
+            "type": "translated_message",
+            "speaker": speaker_id,
+            "text": full_translated_text
+        })
+
+        # E agora, gera o ÁUDIO com o texto completo
+        if full_translated_text:
+            print(f"Sending full text '{full_translated_text}' to TTS for lang '{target_conn.lang}'")
+            await camb_ai_tts_generator(full_translated_text, target_conn.lang, target_conn.ws)
+            
+    except Exception as e:
+        # A excepção original (que causa o seu erro) será impressa aqui no terminal
+        print(f"Error during streaming translation or TTS: {e}")
+        traceback.print_exc()
+        try:
+            await target_conn.ws.send_json({
+                "type": "system_error", 
+                "message": f"Failed to get translation/audio for speaker {speaker_id}."
+            })
+        except Exception:
+            pass # A ligação pode já estar fechada
+
+
 async def tts_worker_task(processing_queue: asyncio.Queue, session_id: str, user_id: str, lang: str):
+    """
+    Esta é a nova versão da tts_worker_task.
+    Ela chama a nova função stream_translation_and_tts.
+    """
     while True:
         try:
             final_text = await processing_queue.get()
             if final_text is None: break
-            await manager.sessions[session_id][user_id].ws.send_json({"type": "my_final_transcription", "text": final_text})
+            
+            # 1. Envia a transcrição final para o PRÓPRIO utilizador
+            if session_id in manager.sessions and user_id in manager.sessions[session_id]:
+                await manager.sessions[session_id][user_id].ws.send_json({
+                    "type": "my_final_transcription", 
+                    "text": final_text
+                })
+            else:
+                continue # O utilizador desconectou-se entretanto
+
+            # 2. Faz o streaming da tradução E do áudio para os OUTROS utilizadores
             for other_user_id, conn in manager.sessions.get(session_id, {}).items():
                 if other_user_id != user_id:
-                    translated_text = f"(Translated from {lang}) {final_text}"
-                    await conn.ws.send_json({"type": "translated_message", "speaker": user_id, "text": translated_text})
-                    await camb_ai_tts_generator(translated_text, conn.lang, conn.ws)
+                    # Inicia a nova tarefa de streaming para cada ouvinte
+                    asyncio.create_task(stream_translation_and_tts(
+                        text_to_translate=final_text,
+                        source_lang=lang,
+                        target_conn=conn,
+                        speaker_id=user_id
+                    ))
+                    
         except Exception:
              print(f"--- ERROR IN TTS WORKER for user {user_id} ---"); traceback.print_exc()
+
 
 # --- API Endpoints & Main Loop ---
 @app.get("/")
@@ -169,9 +313,26 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str, user_id: str
             if "text" in data:
                 message = json.loads(data["text"])
                 if message.get("type") == "end_of_speech":
+                    print(f"Received end_of_speech from {user_id}")
+                    
+                    # 1. Dispara o evento para finalizar o TEXTO
                     end_speech_event.set()
+                    
+                    # 2. [A CORREÇÃO] Drena a fila de ÁUDIO.
+                    print(f"Draining audio queue for {user_id} to prevent accumulation...")
+                    drained_count = 0
+                    while not audio_queue.empty():
+                        audio_queue.get_nowait() # Retira item sem esperar
+                        drained_count += 1
+                    if drained_count > 0:
+                        print(f"Drained {drained_count} late audio packets.")
+
             elif "bytes" in data:
-                await audio_queue.put(data["bytes"])
+                # 3. Só adiciona áudio à fila se NÃO estivermos no
+                #    processo de "parar de falar".
+                if not end_speech_event.is_set():
+                    await audio_queue.put(data["bytes"])
+                        
     except WebSocketDisconnect:
         print(f"Client {user_id} disconnected gracefully.")
     except Exception:
